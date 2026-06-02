@@ -1,4 +1,4 @@
-"""Minimal Tkinter GUI: file pickers + Run."""
+"""Minimal Tkinter GUI: file pickers + output-mode selector + Run."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .app import BuildRequest, run_build
 def launch() -> None:
     root = tk.Tk()
     root.title("SlideTool")
-    root.geometry("620x340")
+    root.geometry("640x420")
     SlideToolUI(root)
     root.mainloop()
 
@@ -26,6 +26,7 @@ class SlideToolUI:
         self.ref_var = tk.StringVar()
         self.duration_var = tk.StringVar()
         self.fps_var = tk.StringVar(value="24")
+        self.mode_var = tk.StringVar(value="powerpoint")
         self.status_var = tk.StringVar(value="Ready.")
 
         pad = {"padx": 8, "pady": 4}
@@ -53,12 +54,25 @@ class SlideToolUI:
         ttk.Entry(frm, textvariable=self.fps_var, width=14).grid(
             row=4, column=1, sticky="w", **pad)
 
+        mode_frame = ttk.LabelFrame(frm, text="Output mode")
+        mode_frame.grid(row=5, column=0, columnspan=3, sticky="we", **pad)
+        ttk.Radiobutton(
+            mode_frame,
+            text="PowerPoint native (preserves animations & transitions; slower)",
+            variable=self.mode_var, value="powerpoint",
+        ).pack(anchor="w", padx=8, pady=2)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Flat slides (fast preview; final state only, no animations)",
+            variable=self.mode_var, value="flat",
+        ).pack(anchor="w", padx=8, pady=2)
+
         self.run_btn = ttk.Button(frm, text="Run", command=self._on_run)
-        self.run_btn.grid(row=5, column=1, sticky="w", **pad)
+        self.run_btn.grid(row=6, column=1, sticky="w", **pad)
 
         ttk.Label(frm, textvariable=self.status_var, foreground="#444",
-                  wraplength=580).grid(
-            row=6, column=0, columnspan=3, sticky="we", **pad)
+                  wraplength=600).grid(
+            row=7, column=0, columnspan=3, sticky="we", **pad)
 
         frm.columnconfigure(1, weight=1)
 
@@ -109,6 +123,7 @@ class SlideToolUI:
             fps=fps,
             total_duration_s=total,
             reference_media=Path(ref) if ref else None,
+            output_mode=self.mode_var.get(),  # type: ignore[arg-type]
         )
 
     def _do_run(self, req: BuildRequest):
@@ -125,15 +140,12 @@ class SlideToolUI:
     def _on_done_ok(self, result):
         self.run_btn.config(state="normal")
         self.status_var.set(f"Done: {result.out_path}")
-        if result.n_cues != result.n_slides - 1:
-            messagebox.showwarning(
-                "SlideTool",
-                f"{result.n_slides} slides but {result.n_cues} cues "
-                f"(expected {result.n_slides - 1}). The video was built "
-                "with even-padded durations where cues were missing.",
-            )
-        else:
-            messagebox.showinfo("SlideTool", f"Wrote {result.out_path}")
+        messagebox.showinfo(
+            "SlideTool",
+            f"Wrote {result.out_path}\n"
+            f"Mode: {result.output_mode}, cues: {result.n_cues}, "
+            f"total: {result.total_duration_s:.2f}s",
+        )
 
     def _on_done_error(self, exc: BaseException):
         self.run_btn.config(state="normal")

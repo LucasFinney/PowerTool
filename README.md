@@ -15,53 +15,103 @@ The original workflow:
 
 Step 4 is purely mechanical given the markers — but doing it by hand takes time and is error-prone. SlideTool replaces it.
 
+## Output modes
+
+SlideTool ships with two exporters. They consume the same inputs (deck + cues + total duration) and produce the same kind of output (a single MP4), but make different trade-offs:
+
+### PowerPoint native (default) — preserves animations & transitions
+
+SlideTool writes per-slide advance timings (`<p:transition advClick="0" advTm="…">`) directly into a copy of your deck, then drives PowerPoint via COM to call its built-in **Create a Video** function with `UseTimingsAndNarrations=True`. The resulting MP4 includes every slide transition and every within-slide animation, exactly as PowerPoint would render them if you'd recorded the timings by hand.
+
+This is the right choice when SMEs have authored animations or transitions that need to appear in the final video.
+
+**Trade-offs:**
+- Requires Windows + PowerPoint installed.
+- Significantly slower than the flat path — PowerPoint's encoder is minute-scale for a typical deck.
+- PowerPoint's encoder is configurable only by quality preset (0–100), resolution, and frame rate. No codec choice or CRF.
+
+### Flat slides — fast, no animations
+
+SlideTool rasterizes each slide to a PNG (final state only — animations and transitions are gone) and uses ffmpeg's concat demuxer to hold each PNG for its computed duration in a single H.264 encode.
+
+This is the right choice for fast previews, for decks with no animations, or as a fallback when PowerPoint isn't available.
+
+**Trade-offs:**
+- No animations, no transitions, no within-slide builds.
+- Falls back to LibreOffice for rasterization if PowerPoint COM isn't available (also needs `pdftoppm`).
+
 ## How it works
 
 ```
    .pptx              markers CSV          reference audio (or typed duration)
      │                    │                          │
      ▼                    ▼                          ▼
- ┌────────┐         ┌──────────┐               ┌──────────┐
- │ slides │         │   cues   │               │ assemble │
- │ (PPTX  │         │ (Resolve │               │  (ffmpeg │
- │ → PNGs)│         │ CSV →    │               │  probe + │
- └────┬───┘         │  seconds)│               │  concat) │
-      │             └────┬─────┘               └────┬─────┘
-      │ slide PNGs       │ cue times                │ total duration
-      └──────────────────┴───────────┬──────────────┘
-                                     ▼
-                             one synced MP4
+              ┌────────────────────────┐
+              │   cues.parse_resolve_  │
+              │   markers              │
+              └────────────┬───────────┘
+                           │ cue times (seconds)
+                           ▼
+              ┌────────────────────────┐
+              │  app.run_build picks   │
+              │  output mode           │
+              └─────┬──────────────┬───┘
+                    │              │
+            ┌───────▼──────┐  ┌────▼────────────┐
+            │ exporters/   │  │ exporters/      │
+            │ flat.py      │  │ powerpoint.py   │
+            │ (rasterize + │  │ (timings.py     │
+            │  ffmpeg      │  │  writes advTm,  │
+            │  concat)     │  │  PowerPoint     │
+            │              │  │  CreateVideo)   │
+            └───────┬──────┘  └────────┬────────┘
+                    └──────┬───────────┘
+                           ▼
+                     one synced MP4
 ```
 
-Per-slide duration math: slide 1 starts at t=0 and ends at the first cue; slide *k* ends at cue *k*; the final slide ends at the total duration. ffmpeg's concat demuxer holds each PNG for its computed duration in a single encode.
+Per-slide duration math (shared by both exporters): slide 1 starts at t=0 and ends at the first cue; slide *k* ends at cue *k*; the final slide ends at the total duration.
 
 ## Project layout
 
 ```
-PowerTool/                 ← repo root (and your working directory)
-├── README.md              ← you are here
+PowerTool/                     ← repo root (and your working directory)
+├── README.md                  ← you are here
 ├── LICENSE
-├── requirements.txt       ← comtypes on Windows; everything else is stdlib
-├── __main__.py            ← convenience entry; same as `python -m slidetool`
-└── slidetool/             ← the package
+├── requirements.txt           ← python-pptx; comtypes on Windows
+├── __main__.py                ← convenience entry; same as `python -m slidetool`
+└── slidetool/                 ← the package
     ├── __init__.py
-    ├── app.py             ← orchestration: BuildRequest, run_build()
-    ├── gui.py             ← Tkinter window: file pickers + Run
-    ├── cues.py            ← Resolve marker CSV → list[float] of cue seconds
-    ├── slides.py          ← .pptx → one PNG per slide (PowerPoint COM, LibreOffice fallback)
-    └── assemble.py        ← ffmpeg concat-demuxer build; ffprobe duration probe
+    ├── app.py                 ← orchestration: BuildRequest, run_build()
+    ├── gui.py                 ← Tkinter window: pickers + output-mode radio + Run
+    ├── cues.py                ← INPUT SEAM: marker CSV → list[float] of cue seconds
+    ├── timings.py             ← OOXML writer: stamps advTm into a .pptx copy
+    ├── slides.py              ← .pptx → one PNG per slide (PowerPoint COM, LibreOffice fallback)
+    ├── assemble.py            ← shared utils: compute_durations, ffprobe, ffmpeg concat
+    └── exporters/             ← OUTPUT SEAM: pluggable exporters with a common signature
+        ├── __init__.py        ← MODES = {"flat": ..., "powerpoint": ...}
+        ├── flat.py            ← rasterize + ffmpeg-concat path
+        └── powerpoint.py      ← advTm + PowerPoint CreateVideo path
 ```
 
-### The Tier 2 seam
+### Architectural seams (input and output)
 
-`cues.py` is the deliberate swap point in the architecture. Any function that returns `list[float]` of cue timestamps in seconds is interchangeable with the current `parse_resolve_markers`. The planned Tier 2 upgrade plugs in alongside it:
+SlideTool has two deliberate plug-in points:
 
-```python
-# Tier 2 (future): transcript-driven cues, no manual markers needed
-cues.transcribe_and_match(voiceover_audio, deck) -> list[float]
-```
+- **`cues.py` — input seam.** Any function returning `list[float]` of cue timestamps in seconds is interchangeable with the current `parse_resolve_markers`. The planned Tier 2 upgrade plugs in alongside it:
+  ```python
+  cues.transcribe_and_match(voiceover_audio, deck) -> list[float]
+  ```
+  That function would run the voiceover through faster-whisper, pull a trigger phrase per slide from PowerPoint speaker notes, fuzzy-match each phrase against the transcript, and return the matched start timestamps. Same contract — the rest of the pipeline doesn't change.
 
-That function would run the voiceover through faster-whisper, pull a trigger phrase per slide from PowerPoint speaker notes, fuzzy-match each phrase against the transcript, and return the matched start timestamps. Same `list[float]` contract — the rest of the pipeline doesn't change.
+- **`exporters/` — output seam.** Each exporter implements:
+  ```python
+  export(
+      pptx_path, cue_times_s, total_duration_s, out_path, on_progress,
+      *, width=1920, height=1080, fps=30,
+  ) -> Path
+  ```
+  Adding a new exporter is a matter of registering it in `exporters/__init__.MODES` and adding a GUI radio option.
 
 ## Workflow
 
@@ -76,8 +126,9 @@ That function would run the voiceover through faster-whisper, pull a trigger phr
    - Pick the markers CSV.
    - Either pick a reference audio/video file (its duration sets when the last slide ends) **or** type a total duration in seconds.
    - Confirm the timeline FPS (default 24).
+   - Pick an output mode: **PowerPoint native** (default — preserves animations) or **Flat slides** (fast preview).
    - Hit **Run**.
-5. The output MP4 lands next to the `.pptx` as `<deckname>.synced.mp4`. Drop it on a video track above your voiceover — the slide changes will already align with the cues.
+5. The output MP4 lands next to the `.pptx` as `<deckname>.synced.mp4`. Drop it on a video track above your voiceover.
 
 ### Headless / programmatic use
 
@@ -92,32 +143,41 @@ result = run_build(BuildRequest(
     markers_csv=Path("markers.csv"),
     fps=24.0,
     reference_media=Path("voiceover.wav"),  # or total_duration_s=583.4
+    output_mode="powerpoint",               # or "flat"
 ))
-print(result.out_path, result.n_slides, result.n_cues)
+print(result.out_path, result.n_cues, result.output_mode)
 ```
 
 ## Requirements
 
-- **Windows + PowerPoint installed** — used for high-fidelity slide rasterization via COM (`comtypes`).
-- **ffmpeg.exe and ffprobe.exe on PATH** — for video assembly and duration probing.
+- **Windows + PowerPoint installed** — required for the PowerPoint-native exporter and recommended for the flat exporter's PPTX rasterization. Accessed via COM (`comtypes`).
+- **`ffmpeg.exe` and `ffprobe.exe` on PATH** — needed for the flat exporter and for probing reference-media durations.
 - **Python 3.10+**
-- Install package deps with `pip install -r requirements.txt` (just `comtypes` on Windows; everything else is stdlib including the Tkinter GUI).
+- Install package deps with `pip install -r requirements.txt` (just `python-pptx` and, on Windows, `comtypes`; everything else is stdlib including the Tkinter GUI).
 
-**Fallback**: if PowerPoint COM is unavailable, SlideTool tries LibreOffice (`soffice`) headless. The fallback also needs `pdftoppm` (poppler) on PATH because LibreOffice's direct PNG export only emits the first slide, so we go via PDF.
+**Fallbacks:** if PowerPoint COM is unavailable, the flat exporter falls back to LibreOffice (`soffice`) headless. That fallback also needs `pdftoppm` (poppler) on PATH because LibreOffice's direct PNG export only emits the first slide, so the fallback goes via PDF. The PowerPoint-native exporter has no fallback — PowerPoint is required.
+
+## Authoring rules for animated decks
+
+When using the PowerPoint-native exporter, a few PowerPoint behaviors carry over from PowerPoint's own "Create a Video" feature and are worth knowing about. None are SlideTool bugs — they're consequences of how PowerPoint exports.
+
+- **Within-slide animations play at their authored timing**, not stretched to fit the slide's `advTm`. If the animation sequence is shorter than the cue gap, the slide holds on its final state for the remainder (this is what you want). If it's *longer*, PowerPoint cuts the animation off when the slide advances. A future enhancement could warn when authored animation duration exceeds the cue gap.
+- **"On Click" animation triggers will not auto-fire** in exported video. Animations need to be set to "Start: After Previous" or "Start: With Previous" (with their own delays) to appear. This is a one-time content-authoring rule for SMEs.
+- **Slide transitions ARE preserved.** If a slide has, e.g., a Fade or Push transition, the exported video shows it.
 
 ## Behavior notes & edge cases
 
-- **Hard cuts only** in v1 — no transitions, animations, or per-slide builds. The final state of each slide is what gets rendered. This matches the existing manual workflow.
-- **Cue/slide count mismatch**: if there are fewer cues than slide gaps (`n_slides - 1`), the remaining slides at the tail each get an equal share of leftover time, and the GUI shows a warning. If there are *more* cues than gaps, extras beyond `n_slides - 1` are silently dropped.
+- **Cue/slide count mismatch**: if there are fewer cues than slide gaps (`n_slides - 1`), the remaining slides at the tail each get an equal share of leftover time. If there are *more* cues than gaps, extras beyond `n_slides - 1` are silently dropped.
 - **Coincident cues** (two cues at the same instant, or one within ~1/60s of another) are clamped so every slide gets at least one frame.
 - **Timecode parsing** accepts both `HH:MM:SS:FF` (non-drop) and `HH:MM:SS;FF` (drop-frame). Drop-frame is treated as non-drop — close enough for cue placement at standard rates. If you ever need frame-accurate sync across very long durations at 29.97/59.94, this is where to revisit.
-- **Output**: H.264 / yuv420p MP4 at CRF 18, 30 fps container framerate, faststart-flagged. Re-imports into Resolve without transcoding hiccups.
+- **Output (flat mode)**: H.264 / yuv420p MP4 at CRF 18, faststart-flagged. Container framerate defaults to 30 fps. Re-imports into Resolve without transcoding hiccups.
+- **Output (PowerPoint mode)**: H.264 MP4 at the resolution / fps / quality you set. PowerPoint controls the encoder.
 
 ## Tiers / roadmap
 
-- **Tier 1 (shipped)** — marker-driven assembler. What's in this repo.
-- **Tier 2 (planned, not built)** — transcript-driven cues via faster-whisper + speaker-notes trigger phrases. Plugs into `cues.py`; nothing else changes. Eliminates the manual marker step.
-- **Tier 3 (not planned)** — real-time presenter mode (streaming Whisper + PowerPoint COM advancing live slides). Significantly more fiddly; post-hoc is sufficient for the current need.
+- **Tier 1 (shipped)** — marker-driven assembler, two output modes (flat + PowerPoint-native).
+- **Tier 2 (planned)** — transcript-driven cues via faster-whisper + speaker-notes trigger phrases. Plugs into `cues.py`; eliminates the manual marker step.
+- **Tier 3 (not planned)** — real-time presenter mode. Post-hoc is sufficient for the current need.
 
 ## Packaging
 
